@@ -45,15 +45,15 @@ Database table columns:
 	debug["info"] = true;
 	debug["sql"] = true;
 
-
 -- get waiting calls
 	sql = [[SELECT * FROM v_dialer_queue vdq WHERE vdq.status = 'waiting' AND vdq.attempts < 3 LIMIT 1]];
 
--- var to see if there is any values in the query
-	values_returned = 0
+--general vars
+	values_returned = 0 -- var to see if there is any values in the query
+	max_attempts = 3 -- max call attempts
+	dispoA = "None" --default disposition
+	transfer_dest = "sofia/internal/102%lab.smartipcloud.com" --destination for the calls to be transfered to in selected.
 
--- max call attempts
-	max_attempts = 3
 
 -- build array from sql query
 	queue = {} --used for storing calls in queue
@@ -70,13 +70,22 @@ Database table columns:
 	--check if there are calls in the table
 	if values_returned == 1 then
 		freeswitch.consoleLog("notice", "Attempting to call out." .. "\n");
-	
+		
 		--attempt the call
 		outSession = freeswitch.Session("{origination_caller_id_name="..queue["campaign_name"]..",origination_caller_id_number=".. "9057592660" .."}sofia/gateway/20ce1603-7865-46c3-86dc-a06f4f1b43b8/".. queue["phone_number"])
 		outSession:setAutoHangup(false)
-		if outSession:ready() then
+
+		while(outSession:ready() and dispoA ~= "ANSWER") do
+			dispoA = outSession:getVariable("endpoint_disposition")
+			freeswitch.consoleLog("INFO","Leg A disposition is '" .. dispoA .. "'\n")
+			os.execute("sleep 1")
+		end
+		if ( outSession:ready() ) then
+			--pause for 1 second
+				outSession:execute("sleep", 1000)
+
 			--play and collect digits (min_digits,max_digits,max_attempts,timeout,terminators,audio_file,error_audio_file,digit_regex)
-				digits = outSession:playAndGetDigits(1, 1, 3, 3000, "", queue["wav_location"], "/error.wav", "\\d+")
+				digits = outSession:playAndGetDigits(1, 1, 3, 5000, "", queue["wav_location"], "/error.wav", "\\d+")
 
 			-- if 1 is pressed then the call is accepted
 			if digits == "1" then
@@ -84,12 +93,29 @@ Database table columns:
 				local params = {
 					primary_key = queue["primary_key"];
 				}
-				dbh:query("UPDATE v_dialer_queue SET status = 'complete', result = 'accepted' where primary_key = :primary_key", params);
+				dbh:query("UPDATE v_dialer_queue SET status = 'complete', result = 'accepted', attempts = "..queue["attempts"]+1 .." where primary_key = :primary_key", params);
+				digits = outSession:playAndGetDigits(1, 1, 3, 5000, "", "/var/lib/freeswitch/recordings/lab.smartipcloud.com/recording3.wav", "/error.wav", "\\d+")
+				if digits == "1" then
+					legB = freeswitch.Session(transfer_dest)
+					if ( outSession:ready() and legB:ready() ) then
+        				freeswitch.bridge(outSession,legB)
+    				end
+				end
+			else
+				--caller did not press 1 - add an attempt
+				local params = {
+					primary_key = queue["primary_key"];
+				}
+				dbh:query("UPDATE v_dialer_queue SET result = 'not_accepted', attempts = "..queue["attempts"]+1 .." where primary_key = :primary_key", params);
 			end
 			outSession:hangup();
 
 		--unable to complete the call
 		else
+			-- opps, lost leg A handle this case
+			freeswitch.consoleLog("NOTICE","It appears that outSession is disconnected...\n")
+
+
 			-- log the hangup cause
 			local outCause = outSession:hangupCause()
 			freeswitch.consoleLog("info", "outSession:hangupCause() = " .. outCause)
